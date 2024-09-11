@@ -1,0 +1,42 @@
+setuptools~=69.5.1
+
+einops-exts
+k-diffusion
+ninja
+openai-clip
+
+# === Webui Built-In === #
+# PyYAML
+# accelerate
+# diffusers
+# einops
+# facexlib
+# fastapi
+# fsspec
+# gradio_client
+# gradio_imageslider
+# httpx
+# kornia
+# matplotlib
+# numpy
+# omegaconf
+# open-clip-torch
+# opencv-python
+# pandas
+# pillow
+# pytorch-lightning
+# requests
+# scikit-learn
+# scipy
+# sentencepiece
+# timm
+# tokenizers
+# tqdm
+# transformers
+# urllib3
+# uvicorn
+
+# === PyTorch Pain === #
+# torchvision
+# triton
+# xformers

@@ -1,16 +1,14 @@
-from rich import print
-from PIL import Image
+from functools import wraps
 import gradio as gr
 import numpy as np
 import safetensors
+import builtins
 import einops
 import random
 import torch
 import copy
-import math
 import time
-import sys
-import re
+import rich
 import os
 
 from SUPIR.util import (
@@ -26,7 +24,23 @@ from modules.paths import models_path
 from modules import sd_models
 import spaces
 
-stdout = sys.stdout
+py_print = builtins.print
+
+
+@wraps(py_print)
+def filtered_print(*args, **kwargs):
+    filtered = [
+        str(text).strip()
+        for text in args
+        if bool(str(text).strip())
+        and not any(
+            x in text for x in ("Setting up", "checkpointing", "-chn", "WARNING")
+        )
+    ]
+
+    if filtered:
+        rich.print(*filtered, **kwargs)
+
 
 POS_PROMPT = "cinematic, high contrast, detailed, canon camera, photorealistic, maximum detail, 4k, color grading, ultra hd, sharpness, perfect"
 NEG_PROMPT = "painting, illustration, drawing, art, sketch, anime, cartoon, CG Style, 3D render, blur, aliasing, unsharp, weird textures, ugly, dirty, messy, worst quality, low quality, frames, watermark, signature, jpeg artifacts, lowres"
@@ -42,45 +56,46 @@ if os.path.exists("../style.css"):
         styles = style.readlines()
         CSS += styles
 
+
+builtins.print = filtered_print
+
 with spaces.capture_gpu_object() as GO:
 
-    print("[bright_black]Loading SUPIR...")
+    rich.print("[bright_black]Loading SUPIR...")
 
-    with open(os.devnull, "w") as fnull:
-        sys.stdout = fnull
+    SUPIR_device = spaces.gpu
+    SUPIR_CKPT = os.path.join(models_path, "SUPIR", "SUPIR-v0Q.safetensors")
+    CKPT = sd_models.model_data.forge_loading_parameters["checkpoint_info"].filename
 
-        SUPIR_device = spaces.gpu
-        SUPIR_CKPT = os.path.join(models_path, "SUPIR", "SUPIR-v0Q.safetensors")
-        CKPT = sd_models.model_data.forge_loading_parameters["checkpoint_info"].filename
+    model = create_SUPIR_model(
+        "options/SUPIR_v0.yaml",
+        SDXL_CKPT=CKPT,
+        SUPIR_CKPT=SUPIR_CKPT,
+        load_default_setting=False,
+    )
 
-        model = create_SUPIR_model(
-            "options/SUPIR_v0.yaml",
-            SDXL_CKPT=CKPT,
-            SUPIR_CKPT=SUPIR_CKPT,
-            load_default_setting=False,
-        )
+    model = model.half()
 
-        model = model.half()
+    model.init_tile_vae(
+        encoder_tile_size=512,
+        decoder_tile_size=64,
+    )
 
-        model.init_tile_vae(
-            encoder_tile_size=512,
-            decoder_tile_size=64,
-        )
+    model = model.to(SUPIR_device)
+    # model.to(dtype=torch.float8_e4m3fn, device=SUPIR_device)
 
-        model = model.to(SUPIR_device)
-        # model.to(dtype=torch.float8_e4m3fn, device=SUPIR_device)
+    model.first_stage_model.denoise_encoder_s1 = copy.deepcopy(
+        model.first_stage_model.denoise_encoder
+    )
 
-        model.first_stage_model.denoise_encoder_s1 = copy.deepcopy(
-            model.first_stage_model.denoise_encoder
-        )
+    model.current_model = "v0-Q"
+    ckpt_Q = safetensors.torch.load_file(SUPIR_CKPT, device="cpu")
+    ckpt_F = None
 
-        model.current_model = "v0-Q"
-        ckpt_Q = safetensors.torch.load_file(SUPIR_CKPT, device="cpu")
-        ckpt_F = None
-
-    sys.stdout = stdout
+builtins.print = py_print
 
 spaces.automatically_move_to_gpu_when_forward(model, model.model)
+spaces.automatically_move_to_gpu_when_forward(model, model.first_stage_model)
 spaces.automatically_move_to_gpu_when_forward(ckpt_Q)
 
 
@@ -97,7 +112,7 @@ def stage1_process(
     ae_dtype: str,
 ):
 
-    print("[cyan]stage 1 preprocess")
+    rich.print("[cyan]stage 1 preprocess")
 
     if torch.cuda.device_count() == 0:
         gr.Warning("Non-CUDA Device is probably not supported...")
@@ -135,7 +150,7 @@ def stage1_process(
         LQ *= 255.0
 
     LQ = LQ.round().clip(0, 255).astype(np.uint8)
-    print("[green]stage 1 done")
+    rich.print("[green]stage 1 done")
     memory_management.soft_empty_cache()
     return LQ
 
@@ -158,7 +173,6 @@ def stage2_process(
     color_fix_type,
     diff_dtype,
     ae_dtype,
-    gamma_correction,
     linear_CFG,
     linear_s_stage2,
     spt_linear_CFG,
@@ -169,15 +183,14 @@ def stage2_process(
     p_prompt = p_prompt or ""
     n_prompt = n_prompt or ""
 
-    if prompt:
-        a_prompt = f"{prompt}, {p_prompt}"
-    else:
-        a_prompt = p_prompt
+    a_prompt = f"{prompt}, {p_prompt}" if prompt else p_prompt
 
-    print(f"Final Prompt: {a_prompt}")
+    rich.print(f"Final Prompt: {a_prompt}")
 
-    denoise_image = denoise_image or noisy_image
-    denoise_image = HWC3(denoise_image)
+    seed = seed if (seed >= 0) else random.randint(0, 4294967295)  # 2^32 - 1
+
+    input_image = noisy_image if denoise_image is None else denoise_image
+    input_image = HWC3(denoise_image)
 
     if torch.cuda.device_count() == 0:
         gr.Warning("Non-CUDA Device is probably not supported...")
@@ -188,13 +201,13 @@ def stage2_process(
     start = time.time()
 
     memory_management.soft_empty_cache()
-    print("[cyan]stage 2 restore")
+    rich.print("[cyan]stage 2 restore")
 
     # torch.cuda.set_device(SUPIR_device)
 
     with torch.inference_mode():
         input_image = upscale_image(
-            denoise_image, upscale, unit_resolution=32, min_size=512
+            input_image, upscale, unit_resolution=32, min_size=512
         )
 
         LQ = np.asarray(input_image, dtype=np.float32)
@@ -245,8 +258,8 @@ def stage2_process(
     end = time.time()
     secondes = int(end - start)
 
-    print("[green]restore done")
-    print(f"Took: {secondes}s")
+    rich.print("[green]restore done")
+    rich.print(f"Took: {secondes}s")
 
     return result
 
@@ -302,12 +315,10 @@ def load_preset(preset: str) -> list:
 block = gr.Blocks(css="\n".join(CSS)).queue()
 
 with block:
-    gr.Markdown('<h1 align="center">SUPIR</h1>')
+    gr.HTML('<h1 align="center">SUPIR</h1>')
 
     if torch.cuda.device_count() == 0:
-        gr.Markdown(
-            '<h3 align="center">Non-CUDA Device is probably not supported...</h3>'
-        )
+        gr.HTML('<h3 align="center">Non-CUDA Device is probably not supported...</h3>')
 
     with gr.Row(variant="panel", elem_classes="Image IO"):
 
@@ -541,9 +552,12 @@ with block:
             )
 
     gr.HTML(
-        """<p align="center">
+        """
+        <hr>
+        <p align="center">
             <a href="https://arxiv.org/abs/2401.13627">Paper</a> &emsp; <a href="http://supir.xpixel.group/">Project Page</a> &emsp; <a href="https://github.com/Fanghua-Yu/SUPIR">GitHub Repo</a>
-        </p>"""
+        </p>
+        """
     )
 
     denoise_button.click(
@@ -575,7 +589,6 @@ with block:
             color_fix_type,
             diff_dtype,
             ae_dtype,
-            gamma_correction,
             linear_CFG,
             linear_s_stage2,
             spt_linear_CFG,

@@ -21,11 +21,11 @@ from SUPIR.util import (
     create_SUPIR_model,
 )
 
+from backend import memory_management
 from modules.paths import models_path
 from modules import sd_models
 import spaces
 
-DEBUG = True
 stdout = sys.stdout
 
 POS_PROMPT = "cinematic, high contrast, detailed, canon camera, photorealistic, maximum detail, 4k, color grading, ultra hd, sharpness, perfect"
@@ -44,7 +44,7 @@ if os.path.exists("../style.css"):
 
 with spaces.capture_gpu_object() as GO:
 
-    print("Loading SUPIR...")
+    print("[bright_black]Loading SUPIR...")
 
     with open(os.devnull, "w") as fnull:
         sys.stdout = fnull
@@ -68,6 +68,7 @@ with spaces.capture_gpu_object() as GO:
         )
 
         model = model.to(SUPIR_device)
+        # model.to(dtype=torch.float8_e4m3fn, device=SUPIR_device)
 
         model.first_stage_model.denoise_encoder_s1 = copy.deepcopy(
             model.first_stage_model.denoise_encoder
@@ -79,13 +80,175 @@ with spaces.capture_gpu_object() as GO:
 
     sys.stdout = stdout
 
-spaces.automatically_move_to_gpu_when_forward(model)
+spaces.automatically_move_to_gpu_when_forward(model, model.model)
 spaces.automatically_move_to_gpu_when_forward(ckpt_Q)
 
 
-def check(input_image: np.ndarray) -> bool:
+def validate(input_image: np.ndarray) -> bool:
     if input_image is None:
         raise gr.Error("Upload an image to restore...")
+
+
+@spaces.GPU(gpu_objects=GO, manual_load=False)
+def stage1_process(
+    input_image: np.ndarray,
+    gamma_correction: float,
+    diff_dtype: str,
+    ae_dtype: str,
+):
+
+    print("[cyan]stage 1 preprocess")
+
+    if torch.cuda.device_count() == 0:
+        gr.Warning("Non-CUDA Device is probably not supported...")
+        # return None, None
+
+    # torch.cuda.set_device(SUPIR_device)
+
+    LQ = HWC3(input_image)
+    LQ = fix_resize(LQ, 512)
+    LQ = np.array(LQ) / 255 * 2 - 1
+    LQ = (
+        torch.tensor(LQ, dtype=torch.float32)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(SUPIR_device)[:, :3, :, :]
+    )
+
+    model.ae_dtype = convert_dtype(ae_dtype)
+    model.model.dtype = convert_dtype(diff_dtype)
+
+    LQ = model.batchify_denoise(LQ, is_stage1=True)
+    LQ = (
+        (LQ[0].permute(1, 2, 0) * 127.5 + 127.5)
+        .cpu()
+        .numpy()
+        .round()
+        .clip(0, 255)
+        .astype(np.uint8)
+    )
+
+    # gamma correction
+    if gamma_correction != 1.0:
+        LQ /= 255.0
+        LQ = np.power(LQ, gamma_correction)
+        LQ *= 255.0
+
+    LQ = LQ.round().clip(0, 255).astype(np.uint8)
+    print("[green]stage 1 done")
+    memory_management.soft_empty_cache()
+    return LQ
+
+
+@spaces.GPU(gpu_objects=GO, manual_load=False)
+def stage2_process(
+    noisy_image,
+    denoise_image,
+    prompt,
+    p_prompt,
+    n_prompt,
+    upscale,
+    edm_steps,
+    s_stage1,
+    s_stage2,
+    s_cfg,
+    seed,
+    s_churn,
+    s_noise,
+    color_fix_type,
+    diff_dtype,
+    ae_dtype,
+    gamma_correction,
+    linear_CFG,
+    linear_s_stage2,
+    spt_linear_CFG,
+    spt_linear_s_stage2,
+):
+
+    prompt = prompt or ""
+    p_prompt = p_prompt or ""
+    n_prompt = n_prompt or ""
+
+    if prompt:
+        a_prompt = f"{prompt}, {p_prompt}"
+    else:
+        a_prompt = p_prompt
+
+    print(f"Final Prompt: {a_prompt}")
+
+    denoise_image = denoise_image or noisy_image
+    denoise_image = HWC3(denoise_image)
+
+    if torch.cuda.device_count() == 0:
+        gr.Warning("Non-CUDA Device is probably not supported...")
+
+    model.ae_dtype = convert_dtype(ae_dtype)
+    model.model.dtype = convert_dtype(diff_dtype)
+
+    start = time.time()
+
+    memory_management.soft_empty_cache()
+    print("[cyan]stage 2 restore")
+
+    # torch.cuda.set_device(SUPIR_device)
+
+    with torch.inference_mode():
+        input_image = upscale_image(
+            denoise_image, upscale, unit_resolution=32, min_size=512
+        )
+
+        LQ = np.asarray(input_image, dtype=np.float32)
+        LQ = LQ / 255.0 * 2.0 - 1.0
+
+        LQ = (
+            torch.tensor(LQ, dtype=torch.float32)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(SUPIR_device)[:, :3, :, :]
+        )
+
+        captions = [""]
+
+        samples = model.batchify_sample(
+            LQ,
+            captions,
+            num_steps=edm_steps,
+            restoration_scale=s_stage1,
+            s_churn=s_churn,
+            s_noise=s_noise,
+            cfg_scale=s_cfg,
+            control_scale=s_stage2,
+            seed=seed,
+            num_samples=1,
+            p_p=a_prompt,
+            n_p=n_prompt,
+            color_fix_type=color_fix_type,
+            use_linear_CFG=linear_CFG,
+            use_linear_control_scale=linear_s_stage2,
+            cfg_scale_start=spt_linear_CFG,
+            control_scale_start=spt_linear_s_stage2,
+        )
+
+        x_samples = (
+            (einops.rearrange(samples, "b c h w -> b h w c") * 127.5 + 127.5)
+            .cpu()
+            .numpy()
+            .round()
+            .clip(0, 255)
+            .astype(np.uint8)
+        )
+
+        result = x_samples[0]
+
+    memory_management.soft_empty_cache()
+
+    end = time.time()
+    secondes = int(end - start)
+
+    print("[green]restore done")
+    print(f"Took: {secondes}s")
+
+    return result
 
 
 def reset() -> list:
@@ -336,7 +499,7 @@ with block:
 
                     diff_dtype = gr.Radio(
                         label="Diffusion Data Type",
-                        choices=("fp32", "fp16", "bf16"),
+                        choices=("fp32", "fp16", "bf16", "fp8"),
                         value="bf16" if bf16 else "fp32",
                     )
 
@@ -381,6 +544,44 @@ with block:
         """<p align="center">
             <a href="https://arxiv.org/abs/2401.13627">Paper</a> &emsp; <a href="http://supir.xpixel.group/">Project Page</a> &emsp; <a href="https://github.com/Fanghua-Yu/SUPIR">GitHub Repo</a>
         </p>"""
+    )
+
+    denoise_button.click(
+        fn=validate, inputs=[input_image], show_progress="hidden"
+    ).success(
+        fn=stage1_process,
+        inputs=[input_image, gamma_correction, diff_dtype, ae_dtype],
+        outputs=[denoised_image],
+    )
+
+    diffusion_button.click(
+        fn=validate, inputs=[input_image], show_progress="hidden"
+    ).success(
+        fn=stage2_process,
+        inputs=[
+            input_image,
+            denoised_image,
+            prompt,
+            p_prompt,
+            n_prompt,
+            upscale,
+            edm_steps,
+            s_stage1,
+            s_stage2,
+            s_cfg,
+            seed,
+            s_churn,
+            s_noise,
+            color_fix_type,
+            diff_dtype,
+            ae_dtype,
+            gamma_correction,
+            linear_CFG,
+            linear_s_stage2,
+            spt_linear_CFG,
+            spt_linear_s_stage2,
+        ],
+        outputs=[output_image],
     )
 
     apply_preset.click(

@@ -13,8 +13,6 @@ openai-clip
 # facexlib
 # fastapi
 # fsspec
-# gradio_client
-# gradio_imageslider
 # httpx
 # kornia
 # matplotlib
@@ -26,6 +24,7 @@ openai-clip
 # pillow
 # pytorch-lightning
 # requests
+# rich
 # scikit-learn
 # scipy
 # sentencepiece

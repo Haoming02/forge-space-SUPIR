@@ -15,7 +15,6 @@ from SUPIR.util import (
     HWC3,
     upscale_image,
     fix_resize,
-    convert_dtype,
     create_SUPIR_model,
 )
 
@@ -110,7 +109,7 @@ with spaces.capture_gpu_object() as GO:
 
     rich.print("[bright_black]\nLoading SUPIR...")
 
-    SUPIR_CKPT = os.path.join(models_path, "SUPIR", "SUPIR-v0Q.safetensors")
+    SUPIR_CKPT = os.path.join(models_path, "SUPIR", "SUPIR-v0Q_fp16.safetensors")
     CKPT = sd_models.model_data.forge_loading_parameters["checkpoint_info"].filename
 
     model, sdxl_state_dict = create_SUPIR_model(
@@ -184,18 +183,12 @@ def validate(input_image: np.ndarray) -> bool:
 
 
 @spaces.GPU(gpu_objects=GO, manual_load=True)
-def stage1_process(
-    input_image: np.ndarray,
-    gamma_correction: float,
-    diff_dtype: str,
-    ae_dtype: str,
-):
+def stage1_process(input_image: np.ndarray, gamma_correction: float):
 
     rich.print("[cyan]stage 1 preprocess")
 
     if torch.cuda.device_count() == 0:
         gr.Warning("Non-CUDA Device is probably not supported...")
-        # return None, None
 
     with torch.no_grad():
         with torch.cuda.amp.autocast():
@@ -210,8 +203,6 @@ def stage1_process(
                 .to(SUPIR_device)[:, :3, :, :]
             )
 
-            # model.ae_dtype = convert_dtype(ae_dtype)
-            # model.model.dtype = convert_dtype(diff_dtype)
             model.to(SUPIR_device)
 
             with torch.inference_mode():
@@ -255,8 +246,6 @@ def stage2_process(
     s_churn,
     s_noise,
     color_fix_type,
-    diff_dtype,
-    ae_dtype,
     linear_CFG,
     linear_s_stage2,
     spt_linear_CFG,
@@ -283,8 +272,6 @@ def stage2_process(
             input_image = noisy_image if denoise_image is None else denoise_image
             input_image = HWC3(input_image)
 
-            # model.ae_dtype = convert_dtype(ae_dtype)
-            # model.model.dtype = convert_dtype(diff_dtype)
             model.to(SUPIR_device)
 
             start = time.time()
@@ -532,89 +519,71 @@ with block:
 
             with gr.Accordion(label="Advanced Settings", open=False):
 
-                with gr.Tab("CFG"):
+                s_cfg = gr.Slider(
+                    label="Text Guidance Scale",
+                    info="Guided by Image | Guided by Prompt",
+                    minimum=1.0,
+                    maximum=15.0,
+                    value=7.5,
+                    step=0.5,
+                )
 
-                    s_cfg = gr.Slider(
-                        label="Text Guidance Scale",
-                        info="Guided by Image | Guided by Prompt",
+                with gr.Row():
+
+                    s_stage2 = gr.Slider(
+                        label="Restoring Guidance Strength",
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=1.0,
+                        step=0.05,
+                    )
+
+                    s_stage1 = gr.Slider(
+                        label="Pre-denoising Guidance Strength",
+                        minimum=-1.0,
+                        maximum=6.0,
+                        value=-1.0,
+                        step=1.0,
+                    )
+
+                with gr.Row():
+
+                    s_churn = gr.Slider(
+                        label="S-Churn", minimum=0, maximum=40, value=5, step=1
+                    )
+
+                    s_noise = gr.Slider(
+                        label="S-Noise",
                         minimum=1.0,
-                        maximum=15.0,
-                        value=7.5,
+                        maximum=1.1,
+                        value=1.003,
+                        step=0.001,
+                    )
+
+                with gr.Row():
+
+                    linear_CFG = gr.Checkbox(label="Linear CFG", value=True)
+
+                    linear_s_stage2 = gr.Checkbox(
+                        label="Linear Restoring Guidance", value=False
+                    )
+
+                with gr.Row():
+
+                    spt_linear_CFG = gr.Slider(
+                        label="CFG Start",
+                        minimum=1.0,
+                        maximum=9.0,
+                        value=4,
                         step=0.5,
                     )
 
-                    with gr.Row():
-
-                        s_stage2 = gr.Slider(
-                            label="Restoring Guidance Strength",
-                            minimum=0.0,
-                            maximum=1.0,
-                            value=1.0,
-                            step=0.05,
-                        )
-
-                        s_stage1 = gr.Slider(
-                            label="Pre-denoising Guidance Strength",
-                            minimum=-1.0,
-                            maximum=6.0,
-                            value=-1.0,
-                            step=1.0,
-                        )
-
-                    with gr.Row():
-
-                        s_churn = gr.Slider(
-                            label="S-Churn", minimum=0, maximum=40, value=5, step=1
-                        )
-
-                        s_noise = gr.Slider(
-                            label="S-Noise",
-                            minimum=1.0,
-                            maximum=1.1,
-                            value=1.003,
-                            step=0.001,
-                        )
-
-                    with gr.Row():
-
-                        linear_CFG = gr.Checkbox(label="Linear CFG", value=True)
-
-                        linear_s_stage2 = gr.Checkbox(
-                            label="Linear Restoring Guidance", value=False
-                        )
-
-                    with gr.Row():
-
-                        spt_linear_CFG = gr.Slider(
-                            label="CFG Start",
-                            minimum=1.0,
-                            maximum=9.0,
-                            value=4,
-                            step=0.5,
-                        )
-
-                        spt_linear_s_stage2 = gr.Slider(
-                            label="Guidance Start",
-                            minimum=0.0,
-                            maximum=1.0,
-                            value=0.0,
-                            step=0.05,
-                        )
-
-                with gr.Tab("dtype"):
-
-                    bf16: bool = torch.cuda.is_bf16_supported()
-
-                    diff_dtype = gr.Radio(
-                        label="Diffusion Data Type",
-                        choices=("fp32", "fp16", "bf16", "fp8"),
-                        value="bf16" if bf16 else "fp32",
-                    )
-
-                    ae_dtype = gr.Radio(
-                        label="Auto-Encoder Data Type",
-                        choices=("fp32", "bf16"),
-                        value="bf16" if bf16 else "fp32",
+                    spt_linear_s_stage2 = gr.Slider(
+                        label="Guidance Start",
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.0,
+                        step=0.05,
                     )
 
         with gr.Column(variant="panel", elem_classes="Buttons"):
@@ -660,7 +629,7 @@ with block:
         fn=validate, inputs=[input_image], show_progress="hidden"
     ).success(
         fn=stage1_process,
-        inputs=[input_image, gamma_correction, diff_dtype, ae_dtype],
+        inputs=[input_image, gamma_correction],
         outputs=[denoised_image],
     )
 
@@ -683,8 +652,6 @@ with block:
             s_churn,
             s_noise,
             color_fix_type,
-            diff_dtype,
-            ae_dtype,
             linear_CFG,
             linear_s_stage2,
             spt_linear_CFG,

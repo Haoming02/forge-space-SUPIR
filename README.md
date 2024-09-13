@@ -1,3 +1,1 @@
 - 2.60 GB SUPIR Q
-- 1.71 GB Clip
-- 10.2 GB Clip

@@ -1,12 +1,12 @@
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextConfig
 from functools import wraps
 import gradio as gr
 import numpy as np
-import safetensors
+import open_clip
 import builtins
 import einops
 import random
 import torch
-import copy
 import time
 import rich
 import os
@@ -19,10 +19,72 @@ from SUPIR.util import (
     create_SUPIR_model,
 )
 
+from backend.state_dict import state_dict_prefix_replace
 from backend import memory_management
+
 from modules.paths import models_path
 from modules import sd_models
 import spaces
+
+SUPIR_device = spaces.gpu
+OFFLOAD_device = spaces.cpu
+
+POS_PROMPT = "cinematic, high contrast, detailed, canon camera, photorealistic, maximum detail, 4k, color grading, ultra hd, sharpness, perfect"
+NEG_PROMPT = "painting, illustration, drawing, art, sketch, anime, cartoon, CG Style, 3D render, blur, aliasing, unsharp, weird textures, ugly, dirty, messy, worst quality, low quality, frames, watermark, signature, jpeg artifacts, lowres"
+
+
+def null(*args, **kwargs):
+    return None
+
+
+open_clip.model._build_vision_tower = null
+
+
+def build_text_model_from_openai_state_dict(
+    state_dict: dict,
+    cast_dtype=torch.float16,
+):
+
+    embed_dim = state_dict["text_projection"].shape[1]
+    context_length = state_dict["positional_embedding"].shape[0]
+    vocab_size = state_dict["token_embedding.weight"].shape[0]
+    transformer_width = state_dict["ln_final.weight"].shape[0]
+
+    transformer_heads = transformer_width // 64
+    transformer_layers = len(
+        set(
+            k.split(".")[2]
+            for k in state_dict
+            if k.startswith(f"transformer.resblocks")
+        )
+    )
+
+    vision_cfg = None
+
+    text_cfg = open_clip.CLIPTextCfg(
+        context_length=context_length,
+        vocab_size=vocab_size,
+        width=transformer_width,
+        heads=transformer_heads,
+        layers=transformer_layers,
+    )
+
+    model = open_clip.CLIP(
+        embed_dim,
+        vision_cfg=vision_cfg,
+        text_cfg=text_cfg,
+        quick_gelu=True,
+        cast_dtype=cast_dtype,
+    )
+
+    model.load_state_dict(state_dict, strict=False)
+    model = model.eval()
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    return model
+
 
 py_print = builtins.print
 
@@ -42,61 +104,78 @@ def filtered_print(*args, **kwargs):
         rich.print(*filtered, **kwargs)
 
 
-POS_PROMPT = "cinematic, high contrast, detailed, canon camera, photorealistic, maximum detail, 4k, color grading, ultra hd, sharpness, perfect"
-NEG_PROMPT = "painting, illustration, drawing, art, sketch, anime, cartoon, CG Style, 3D render, blur, aliasing, unsharp, weird textures, ugly, dirty, messy, worst quality, low quality, frames, watermark, signature, jpeg artifacts, lowres"
-
-
-CSS: list[str] = [
-    ".tab-nav { justify-content: center; }",
-    ".gradio-image { margin: auto; }",
-]
-
-if os.path.exists("../style.css"):
-    with open("../style.css", "r") as style:
-        styles = style.readlines()
-        CSS += styles
-
-
 builtins.print = filtered_print
 
 with spaces.capture_gpu_object() as GO:
 
-    rich.print("[bright_black]Loading SUPIR...")
+    rich.print("[bright_black]\nLoading SUPIR...")
 
-    SUPIR_device = spaces.gpu
     SUPIR_CKPT = os.path.join(models_path, "SUPIR", "SUPIR-v0Q.safetensors")
     CKPT = sd_models.model_data.forge_loading_parameters["checkpoint_info"].filename
 
-    model = create_SUPIR_model(
+    model, sdxl_state_dict = create_SUPIR_model(
         "options/SUPIR_v0.yaml",
         SDXL_CKPT=CKPT,
         SUPIR_CKPT=SUPIR_CKPT,
-        load_default_setting=False,
     )
 
-    model = model.half()
+    model.current_model = "v0-Q"
+
+    memory_management.soft_empty_cache()
+
+    rich.print("[bright_black]\nLoading 1st Clip model from SDXL checkpoint...")
+
+    clip_config_path = os.path.join("configs", "clip_vit_config.json")
+    tokenizer_path = os.path.join("configs", "tokenizer")
+
+    sd = state_dict_prefix_replace(
+        sdxl_state_dict, {"conditioner.embedders.0.transformer.": ""}, filter_keys=False
+    )
+
+    clip_text_config = CLIPTextConfig.from_pretrained(clip_config_path)
+
+    model.conditioner.embedders[0].tokenizer = CLIPTokenizer.from_pretrained(
+        tokenizer_path
+    )
+    model.conditioner.embedders[0].transformer = CLIPTextModel(clip_text_config)
+    model.conditioner.embedders[0].transformer.load_state_dict(sd, strict=False)
+    model.conditioner.embedders[0].eval()
+
+    for param in model.conditioner.embedders[0].parameters():
+        param.requires_grad = False
+
+    del sdxl_state_dict
+    memory_management.soft_empty_cache()
+
+    rich.print("[bright_black]\nLoading 2nd Clip model from SDXL checkpoint...")
+
+    sd = state_dict_prefix_replace(
+        sd, {"conditioner.embedders.1.model.": ""}, filter_keys=True
+    )
+    clip_g = build_text_model_from_openai_state_dict(
+        sd, cast_dtype=memory_management.unet_dtype()
+    )
+    model.conditioner.embedders[1].model = clip_g
+
+    del sd, clip_g
+    memory_management.soft_empty_cache()
+
+    model.to(device=SUPIR_device, dtype=memory_management.unet_dtype())
+    model.model.to(torch.float8_e4m3fn)
+    model.first_stage_model.to(torch.bfloat16)
 
     model.init_tile_vae(
         encoder_tile_size=512,
         decoder_tile_size=64,
     )
 
-    model = model.to(SUPIR_device)
-    # model.to(dtype=torch.float8_e4m3fn, device=SUPIR_device)
-
-    model.first_stage_model.denoise_encoder_s1 = copy.deepcopy(
-        model.first_stage_model.denoise_encoder
-    )
-
-    model.current_model = "v0-Q"
-    ckpt_Q = safetensors.torch.load_file(SUPIR_CKPT, device="cpu")
-    ckpt_F = None
+    memory_management.soft_empty_cache()
 
 builtins.print = py_print
 
 spaces.automatically_move_to_gpu_when_forward(model, model.model)
+spaces.automatically_move_to_gpu_when_forward(model, model.conditioner)
 spaces.automatically_move_to_gpu_when_forward(model, model.first_stage_model)
-spaces.automatically_move_to_gpu_when_forward(ckpt_Q)
 
 
 def validate(input_image: np.ndarray) -> bool:
@@ -104,7 +183,7 @@ def validate(input_image: np.ndarray) -> bool:
         raise gr.Error("Upload an image to restore...")
 
 
-@spaces.GPU(gpu_objects=GO, manual_load=False)
+@spaces.GPU(gpu_objects=GO, manual_load=True)
 def stage1_process(
     input_image: np.ndarray,
     gamma_correction: float,
@@ -118,44 +197,49 @@ def stage1_process(
         gr.Warning("Non-CUDA Device is probably not supported...")
         # return None, None
 
-    # torch.cuda.set_device(SUPIR_device)
+    with torch.no_grad():
+        with torch.cuda.amp.autocast():
 
-    LQ = HWC3(input_image)
-    LQ = fix_resize(LQ, 512)
-    LQ = np.array(LQ) / 255 * 2 - 1
-    LQ = (
-        torch.tensor(LQ, dtype=torch.float32)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .to(SUPIR_device)[:, :3, :, :]
-    )
+            LQ = HWC3(input_image)
+            LQ = fix_resize(LQ, 512)
+            LQ = np.array(LQ) / 255 * 2 - 1
+            LQ = (
+                torch.tensor(LQ, dtype=torch.float32)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(SUPIR_device)[:, :3, :, :]
+            )
 
-    model.ae_dtype = convert_dtype(ae_dtype)
-    model.model.dtype = convert_dtype(diff_dtype)
+            # model.ae_dtype = convert_dtype(ae_dtype)
+            # model.model.dtype = convert_dtype(diff_dtype)
+            model.to(SUPIR_device)
 
-    LQ = model.batchify_denoise(LQ, is_stage1=True)
-    LQ = (
-        (LQ[0].permute(1, 2, 0) * 127.5 + 127.5)
-        .cpu()
-        .numpy()
-        .round()
-        .clip(0, 255)
-        .astype(np.uint8)
-    )
+            with torch.inference_mode():
+                LQ = model.batchify_denoise(LQ, is_stage1=True)
 
-    # gamma correction
+            LQ = (
+                (LQ[0].permute(1, 2, 0) * 127.5 + 127.5)
+                .cpu()
+                .numpy()
+                .round()
+                .clip(0, 255)
+                .astype(np.uint8)
+            )
+
+    model.to(OFFLOAD_device)
+
     if gamma_correction != 1.0:
-        LQ /= 255.0
+        LQ = LQ.astype(np.float32) / 255.0
         LQ = np.power(LQ, gamma_correction)
         LQ *= 255.0
 
-    LQ = LQ.round().clip(0, 255).astype(np.uint8)
+    LQ = np.clip(LQ.round(), 0, 255).astype(np.uint8)
     rich.print("[green]stage 1 done")
     memory_management.soft_empty_cache()
     return LQ
 
 
-@spaces.GPU(gpu_objects=GO, manual_load=False)
+@spaces.GPU(gpu_objects=GO, manual_load=True)
 def stage2_process(
     noisy_image,
     denoise_image,
@@ -179,80 +263,83 @@ def stage2_process(
     spt_linear_s_stage2,
 ):
 
+    if torch.cuda.device_count() == 0:
+        gr.Warning("Non-CUDA Device is probably not supported...")
+
     prompt = prompt or ""
     p_prompt = p_prompt or ""
     n_prompt = n_prompt or ""
 
     a_prompt = f"{prompt}, {p_prompt}" if prompt else p_prompt
 
-    rich.print(f"Final Prompt: {a_prompt}")
-
-    seed = seed if (seed >= 0) else random.randint(0, 4294967295)  # 2^32 - 1
-
-    input_image = noisy_image if denoise_image is None else denoise_image
-    input_image = HWC3(denoise_image)
-
-    if torch.cuda.device_count() == 0:
-        gr.Warning("Non-CUDA Device is probably not supported...")
-
-    model.ae_dtype = convert_dtype(ae_dtype)
-    model.model.dtype = convert_dtype(diff_dtype)
-
-    start = time.time()
-
-    memory_management.soft_empty_cache()
+    rich.print(f'Final Prompt:\n"{a_prompt}"')
     rich.print("[cyan]stage 2 restore")
 
-    # torch.cuda.set_device(SUPIR_device)
+    with torch.no_grad():
+        with torch.cuda.amp.autocast():
 
-    with torch.inference_mode():
-        input_image = upscale_image(
-            input_image, upscale, unit_resolution=32, min_size=512
-        )
+            seed = seed if (seed >= 0) else random.randint(0, 4294967295)  # 2^32 - 1
 
-        LQ = np.asarray(input_image, dtype=np.float32)
-        LQ = LQ / 255.0 * 2.0 - 1.0
+            input_image = noisy_image if denoise_image is None else denoise_image
+            input_image = HWC3(input_image)
 
-        LQ = (
-            torch.tensor(LQ, dtype=torch.float32)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(SUPIR_device)[:, :3, :, :]
-        )
+            # model.ae_dtype = convert_dtype(ae_dtype)
+            # model.model.dtype = convert_dtype(diff_dtype)
+            model.to(SUPIR_device)
 
-        captions = [""]
+            start = time.time()
 
-        samples = model.batchify_sample(
-            LQ,
-            captions,
-            num_steps=edm_steps,
-            restoration_scale=s_stage1,
-            s_churn=s_churn,
-            s_noise=s_noise,
-            cfg_scale=s_cfg,
-            control_scale=s_stage2,
-            seed=seed,
-            num_samples=1,
-            p_p=a_prompt,
-            n_p=n_prompt,
-            color_fix_type=color_fix_type,
-            use_linear_CFG=linear_CFG,
-            use_linear_control_scale=linear_s_stage2,
-            cfg_scale_start=spt_linear_CFG,
-            control_scale_start=spt_linear_s_stage2,
-        )
+            memory_management.soft_empty_cache()
 
-        x_samples = (
-            (einops.rearrange(samples, "b c h w -> b h w c") * 127.5 + 127.5)
-            .cpu()
-            .numpy()
-            .round()
-            .clip(0, 255)
-            .astype(np.uint8)
-        )
+            with torch.inference_mode():
+                input_image = upscale_image(
+                    input_image, upscale, unit_resolution=32, min_size=512
+                )
 
-        result = x_samples[0]
+                LQ = np.asarray(input_image, dtype=np.float32)
+                LQ = LQ / 255.0 * 2.0 - 1.0
 
+                LQ = (
+                    torch.tensor(LQ, dtype=torch.float32)
+                    .permute(2, 0, 1)
+                    .unsqueeze(0)
+                    .to(SUPIR_device)[:, :3, :, :]
+                )
+
+                captions = [""]
+
+                samples = model.batchify_sample(
+                    LQ,
+                    captions,
+                    num_steps=edm_steps,
+                    restoration_scale=s_stage1,
+                    s_churn=s_churn,
+                    s_noise=s_noise,
+                    cfg_scale=s_cfg,
+                    control_scale=s_stage2,
+                    seed=seed,
+                    num_samples=1,
+                    p_p=a_prompt,
+                    n_p=n_prompt,
+                    color_fix_type=color_fix_type,
+                    use_linear_CFG=linear_CFG,
+                    use_linear_control_scale=linear_s_stage2,
+                    cfg_scale_start=spt_linear_CFG,
+                    control_scale_start=spt_linear_s_stage2,
+                )
+
+                x_samples = (
+                    (einops.rearrange(samples, "b c h w -> b h w c") * 127.5 + 127.5)
+                    .cpu()
+                    .numpy()
+                    .round()
+                    .clip(0, 255)
+                    .astype(np.uint8)
+                )
+
+                result = x_samples[0]
+
+    model.to(OFFLOAD_device)
     memory_management.soft_empty_cache()
 
     end = time.time()
@@ -311,6 +398,16 @@ def load_preset(preset: str) -> list:
         spt_linear_s_stage2,
     )
 
+
+CSS: list[str] = [
+    ".tab-nav { justify-content: center; }",
+    ".gradio-image { margin: auto; }",
+]
+
+if os.path.exists("../style.css"):
+    with open("../style.css", "r") as style:
+        styles = style.readlines()
+        CSS += styles
 
 block = gr.Blocks(css="\n".join(CSS)).queue()
 
@@ -553,7 +650,6 @@ with block:
 
     gr.HTML(
         """
-        <hr>
         <p align="center">
             <a href="https://arxiv.org/abs/2401.13627">Paper</a> &emsp; <a href="http://supir.xpixel.group/">Project Page</a> &emsp; <a href="https://github.com/Fanghua-Yu/SUPIR">GitHub Repo</a>
         </p>

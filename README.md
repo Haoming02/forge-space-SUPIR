@@ -2,8 +2,9 @@
 <p align="right"><b><i>BETA</i></b></p>
 
 > [!IMPORTANT]
-> This repo is still under testing...
-> Non tech-savvy person is recommended to wait for more stable release...
+> This repo is still under testing... Non tech-savvy person is recommended to wait for a more stable release...
+>
+> PRs are welcomed!
 
 > [!TIP]
 > <ins><b>Hardware Requirement</b></ins>
@@ -30,7 +31,16 @@
 6. Click **Apply and restart UI**
 7. Go to the **Spaces** tab
 8. Find the **SUPIR** space, click **Install**, and wait for the installation
-9. Press **Launch**
+9. **Important:** Select a **SDXL** checkpoint in the `Quicksettings` first
+10. Press **Launch**
+
+## Benchmark
+
+Upscale a `600x800` image to `1216x1600` using `48` steps, on a **RTX 3060** took `~2.5` min
+
+## Known Issue
+
+- Using `Preprocess` seems to make the result worse...
 
 > [!NOTE]
 > While this wrapper is under the MIT license, the underlying SUPIR project and models are for **[non-commercial](https://github.com/Fanghua-Yu/SUPIR/blob/master/LICENSE)** only!

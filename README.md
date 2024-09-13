@@ -34,18 +34,37 @@
 9. **Important:** Select a **SDXL** checkpoint in the `Quicksettings` first
 10. Press **Launch**
 
+<p align="center">
+<img src="./img/space.jpg">
+</p>
+
+<details align="center">
+<summary>UI Screenshot</summary>
+<img src="./img/ui.jpg">
+</details>
+
 ## Benchmark
 
 Upscale a `600x800` image to `1216x1600` using `48` steps, on a **RTX 3060** took `~2.5` min
+
+<p align="center">
+<img src="./img/input.jpg"><br>
+<code>256x256 Input</code>
+</p>
+
+<p align="center">
+<img src="./img/output.jpg"><br>
+<code>1024x1024 Output</code>
+</p>
 
 ## Known Issue
 
 - Using `Preprocess` seems to make the result worse...
 
+<hr>
+
 > [!NOTE]
 > While this wrapper is under the MIT license, the underlying SUPIR project and models are for **[non-commercial](https://github.com/Fanghua-Yu/SUPIR/blob/master/LICENSE)** only!
-
-<hr>
 
 <p align="center">
     <a href="https://arxiv.org/abs/2401.13627">Paper</a> &emsp; <a href="http://supir.xpixel.group/">Project Page</a> &emsp; <a href="https://github.com/Fanghua-Yu/SUPIR">GitHub Repo</a>

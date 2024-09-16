@@ -10,6 +10,7 @@ import torch
 import time
 import rich
 import os
+import gc
 
 from SUPIR.util import (
     HWC3,
@@ -86,24 +87,7 @@ def build_text_model_from_openai_state_dict(
 
 
 py_print = builtins.print
-
-
-@wraps(py_print)
-def filtered_print(*args, **kwargs):
-    filtered = [
-        str(text).strip()
-        for text in args
-        if bool(str(text).strip())
-        and not any(
-            x in text for x in ("Setting up", "checkpointing", "-chn", "WARNING")
-        )
-    ]
-
-    if filtered:
-        rich.print(*filtered, **kwargs)
-
-
-builtins.print = filtered_print
+builtins.print = rich.print
 
 with spaces.capture_gpu_object() as GO:
 
@@ -117,8 +101,6 @@ with spaces.capture_gpu_object() as GO:
         SDXL_CKPT=CKPT,
         SUPIR_CKPT=SUPIR_CKPT,
     )
-
-    model.current_model = "v0-Q"
 
     memory_management.soft_empty_cache()
 
@@ -169,12 +151,10 @@ with spaces.capture_gpu_object() as GO:
     )
 
     memory_management.soft_empty_cache()
+    gc.collect()
 
 builtins.print = py_print
-
 spaces.automatically_move_to_gpu_when_forward(model, model.model)
-spaces.automatically_move_to_gpu_when_forward(model, model.conditioner)
-spaces.automatically_move_to_gpu_when_forward(model, model.first_stage_model)
 
 
 def validate(input_image: np.ndarray) -> bool:
@@ -266,8 +246,6 @@ def stage2_process(
 
     with torch.no_grad():
         with torch.cuda.amp.autocast():
-
-            seed = seed if (seed >= 0) else random.randint(0, 4294967295)  # 2^32 - 1
 
             input_image = noisy_image if denoise_image is None else denoise_image
             input_image = HWC3(input_image)
@@ -431,6 +409,8 @@ with block:
                 height=512,
                 elem_id="image-s1",
                 interactive=False,
+                show_share_button=False,
+                show_download_button=False,
             )
 
             with gr.Row(variant="compact"):
@@ -444,7 +424,9 @@ with block:
                     step=0.1,
                 )
 
-                denoise_button = gr.Button(value="Denoise", variant="primary")
+                with gr.Column(variant="compact"):
+                    denoise_button = gr.Button(value="Denoise", variant="primary")
+                    denoise_remove = gr.Button(value="Clear")
 
         output_image = gr.Image(
             label="High Resolution Output",
@@ -598,6 +580,7 @@ with block:
             upscale = gr.Radio(
                 label="Upscale Factor",
                 choices=(
+                    ("x1", 1),
                     ("x2", 2),
                     ("x4", 4),
                     ("x8", 8),
@@ -623,6 +606,10 @@ with block:
             <a href="https://arxiv.org/abs/2401.13627">Paper</a> &emsp; <a href="http://supir.xpixel.group/">Project Page</a> &emsp; <a href="https://github.com/Fanghua-Yu/SUPIR">GitHub Repo</a>
         </p>
         """
+    )
+
+    denoise_remove.click(
+        fn=lambda: None, inputs=None, outputs=[denoised_image], show_progress="hidden"
     )
 
     denoise_button.click(
@@ -713,6 +700,7 @@ with block:
         show_progress="hidden",
     )
 
+    block.unload(fn=memory_management.unload_all_models)
 
 demo = block
 

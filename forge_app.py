@@ -1,11 +1,12 @@
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextConfig
-from functools import wraps
+import open_clip
+
+open_clip.model._build_vision_tower = lambda *args, **kwargs: None
+
 import gradio as gr
 import numpy as np
-import open_clip
 import builtins
 import einops
-import random
 import torch
 import time
 import rich
@@ -14,8 +15,8 @@ import gc
 
 from SUPIR.util import (
     HWC3,
-    upscale_image,
     fix_resize,
+    upscale_image,
     create_SUPIR_model,
 )
 
@@ -26,23 +27,16 @@ from modules.paths import models_path
 from modules import sd_models
 import spaces
 
-SUPIR_device = spaces.gpu
-OFFLOAD_device = spaces.cpu
+SUPIR_DEVICE = spaces.gpu
+OFFLOAD_DEVICE = spaces.cpu
 
 POS_PROMPT = "cinematic, high contrast, detailed, canon camera, photorealistic, maximum detail, 4k, color grading, ultra hd, sharpness, perfect"
 NEG_PROMPT = "painting, illustration, drawing, art, sketch, anime, cartoon, CG Style, 3D render, blur, aliasing, unsharp, weird textures, ugly, dirty, messy, worst quality, low quality, frames, watermark, signature, jpeg artifacts, lowres"
 
 
-def null(*args, **kwargs):
-    return None
-
-
-open_clip.model._build_vision_tower = null
-
-
 def build_text_model_from_openai_state_dict(
     state_dict: dict,
-    cast_dtype=torch.float16,
+    cast_dtype: torch.dtype = torch.float16,
 ):
 
     embed_dim = state_dict["text_projection"].shape[1]
@@ -59,8 +53,6 @@ def build_text_model_from_openai_state_dict(
         )
     )
 
-    vision_cfg = None
-
     text_cfg = open_clip.CLIPTextCfg(
         context_length=context_length,
         vocab_size=vocab_size,
@@ -71,7 +63,7 @@ def build_text_model_from_openai_state_dict(
 
     model = open_clip.CLIP(
         embed_dim,
-        vision_cfg=vision_cfg,
+        vision_cfg=None,
         text_cfg=text_cfg,
         quick_gelu=True,
         cast_dtype=cast_dtype,
@@ -141,9 +133,10 @@ with spaces.capture_gpu_object() as GO:
     del sd, clip_g
     memory_management.soft_empty_cache()
 
-    model.to(device=SUPIR_device, dtype=memory_management.unet_dtype())
+    model.to(dtype=torch.bfloat16)
+    model.first_stage_model.to(dtype=torch.bfloat16)
+    model.conditioner.to(dtype=torch.bfloat16)
     model.model.to(torch.float8_e4m3fn)
-    model.first_stage_model.to(torch.bfloat16)
 
     model.init_tile_vae(
         encoder_tile_size=512,
@@ -180,10 +173,10 @@ def stage1_process(input_image: np.ndarray, gamma_correction: float):
                 torch.tensor(LQ, dtype=torch.float32)
                 .permute(2, 0, 1)
                 .unsqueeze(0)
-                .to(SUPIR_device)[:, :3, :, :]
+                .to(SUPIR_DEVICE)[:, :3, :, :]
             )
 
-            model.to(SUPIR_device)
+            model.to(SUPIR_DEVICE)
 
             with torch.inference_mode():
                 LQ = model.batchify_denoise(LQ, is_stage1=True)
@@ -197,7 +190,7 @@ def stage1_process(input_image: np.ndarray, gamma_correction: float):
                 .astype(np.uint8)
             )
 
-    model.to(OFFLOAD_device)
+    model.to(OFFLOAD_DEVICE)
 
     if gamma_correction != 1.0:
         LQ = LQ.astype(np.float32) / 255.0
@@ -250,7 +243,7 @@ def stage2_process(
             input_image = noisy_image if denoise_image is None else denoise_image
             input_image = HWC3(input_image)
 
-            model.to(SUPIR_device)
+            model.to(SUPIR_DEVICE)
 
             start = time.time()
 
@@ -268,7 +261,7 @@ def stage2_process(
                     torch.tensor(LQ, dtype=torch.float32)
                     .permute(2, 0, 1)
                     .unsqueeze(0)
-                    .to(SUPIR_device)[:, :3, :, :]
+                    .to(SUPIR_DEVICE)[:, :3, :, :]
                 )
 
                 captions = [""]
@@ -304,7 +297,7 @@ def stage2_process(
 
                 result = x_samples[0]
 
-    model.to(OFFLOAD_device)
+    model.to(OFFLOAD_DEVICE)
     memory_management.soft_empty_cache()
 
     end = time.time()
